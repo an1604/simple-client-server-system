@@ -1,7 +1,5 @@
 import math
 import random
-from collections.abc import Iterable
-
 from sklearn.cluster import DBSCAN, KMeans
 from sklearn.preprocessing import MinMaxScaler
 import numpy as np
@@ -34,8 +32,9 @@ class GeneralNegotiationModel(SAONegotiator):
                 Make the following steps inside:
                 1. Initialize the time variable to 0.0, to keep track of the time limit.
                 2.  We initialize the DetReg tuple using an upper bound of the best utility and worst utility values as bounds.
-                """
+        """
         super(GeneralNegotiationModel, self).__init__(*args, **kwargs)
+        self.elimination_time = 1000  # TODO:SET TO THE CORRECT ELIMINATION TIME OF THE NEGOTIATION.
         self.opponent_times: list[float] = []
         self.opponent_utilities: list[float] = []
         self.previous_offers: list[tuple[float, float]] = []
@@ -63,24 +62,24 @@ class GeneralNegotiationModel(SAONegotiator):
                 if rand_offer[1] < state.relative_time:
                     # Calculating the regression line (li) for the random offer.
                     # We use dynamic programming to save time and unnecessary calculations
-                    rand_offer_key = self.generate_key_for_dp(offer=rand_offer, parent_offer=current_offer)
-                    if not rand_offer_key in self.regression_calculations_dp.keys():
-                        reg_line_li = self.calc_regression_curve(rand_offer=rand_offer, current_offer=current_offer)
-                        self.regression_calculations_dp[rand_offer_key] = reg_line_li
-                    else:
-                        reg_line_li = self.regression_calculations_dp[rand_offer_key]
-
+                    reg_line_li = self.calc_regression_curve(rand_offer=rand_offer, current_offer=current_offer)
                     # Extract the fitted offers that match the regression line constraint.
                     fitted_offers = self.get_fitted_offers(regression_line=reg_line_li, random_offers=rand_offers)
                     if len(fitted_offers) > 0:
                         """
                         Calculating the non-linear correlation between opponent's historical offers and the fitted offers.
-                         If the value of coefficient is close to 1 - this offer is good offer and we can save it as a good one.
-                         If the value of coefficient is close to -1 - this offer is a bad offer and we can prevent it.
+                        The more consistent the fitted offers are with opponent’s historical offers, 
+                        the higher the conditional probability P(O|Hi) will be. 
                          """
                         coefficient = self.calc_nonlinear_correlation_coefficient(fitted_offers=fitted_offers,
                                                                                   t=state.relative_time)
-                    self.update_hypothesis(current_offer=state.current_offer)
+                        # self.increase_conditional_probability_Hi()
+                        self.update_hypothesises(current_offer=state.current_offer, conditional_porba=coefficient)
+                        accept = self.is_acceptable(current_offer=state.current_offer,
+                                                    reserved_offer=(self.elimination_time, self.ufun.best()),
+                                                    rand_offer=rand_offer)
+                        if accept:
+                            return SAOResponse(ResponseType.ACCEPT_OFFER, state.current_offer)
 
     def save_offer(self, current_offer, relative_time):
         self.opponent_times.append(relative_time)
@@ -218,23 +217,23 @@ class GeneralNegotiationModel(SAONegotiator):
     def get_probability_distribution_hypotheses(self, single_outcome, single_hypotheses):
         single_outcome = self.min_max_scaler(single_outcome)
         single_outcome = np.array(single_outcome)
-        p = self.kmeans_clustering.predict([single_outcome])
-        # TODO: CHECK THE OUTPUT OF p!
-        if p == single_hypotheses:
-            return self.probability_distribution_hypotheses[f"H_{p}"]
+        prediction = self.kmeans_clustering.predict([single_outcome])
+        # TODO: CHECK THE OUTPUT OF `prediction`!
+        if prediction == single_hypotheses:
+            return self.probability_distribution_hypotheses[f"H_{prediction}"]
 
-    def update_hypothesis(self, current_offer):
+    def update_hypothesises(self, current_offer, conditional_porba):
         """
-        returns a renewed belief based on the observed outcome O(current_offer) and at next round, the agent will
-        update the prior probability P(Hi) using the posterior probability P(Hi|O), thus a
-        more precise estimation is achieved by using the following Equation:
-            P(Hi|O) = P(Hi)P(O|Hi) // ∑ (N_all> k >0) = P(O|Hk)P(Hk)
-            Where:
-                P(O|Hi)- represents the likelihood that outcome might happen based on hypothesis Hi.
-                P(Hi) - represents the hypothesis probability.
-            Args:
-                param current_offer: the current offer of the opponent.
-
+        The Bayesian learning process:
+            returns a renewed belief based on the observed outcome O(current_offer) and at next round, the agent will
+            update the prior probability P(Hi) using the posterior probability P(Hi|O), thus a
+            more precise estimation is achieved by using the following Equation:
+                P(Hi|O) = P(Hi)P(O|Hi) // ∑ (N_all> k >0) = P(O|Hk)P(Hk)
+                Where:
+                    P(O|Hi)- represents the likelihood that outcome might happen based on hypothesis Hi.
+                    P(Hi) - represents the hypothesis probability.
+                Args:
+                    param current_offer: the current offer of the opponent.
         """
         denominator = 0.0
         for k, v in self.probability_distribution_hypotheses.items():
@@ -242,44 +241,54 @@ class GeneralNegotiationModel(SAONegotiator):
             label = int(k.split('_')[-1])
             p_h_i = self.probability_of_Hi(label)
 
-            conditional_probability = self.get_probability_distribution_hypotheses(single_outcome=current_offer,
-                                                                                   single_hypotheses=label)
-            denominator += p_h_i * conditional_probability
+            # conditional_probability = self.get_probability_distribution_hypotheses(single_outcome=current_offer,
+            #                                                                        single_hypotheses=label)
+            denominator += p_h_i * conditional_porba
 
         n_all = [k for k in self.probability_distribution_hypotheses.keys()]
         for key_i in range(n_all):
             i = int(key_i.split('_')[-1])
-            numerator = self.probability_of_Hi(i) * self.get_probability_distribution_hypotheses(
-                single_outcome=current_offer,
-                single_hypotheses=i
-            )
+            numerator = self.probability_of_Hi(i) * conditional_porba  # self.get_probability_distribution_hypotheses(
+            # single_outcome = current_offer,
+            # single_hypotheses = i)
             self.probability_distribution_hypotheses[key_i] = numerator / denominator
 
-    def calc_regression_curve(self, rand_offer, current_offer):
+    def calc_regression_curve(self, rand_offer, current_offer) -> tuple:
         """
-        At each random point that chosen in the __call__() method, the agent have to calculate
-        the regression curve li based on the opponent's historical offers.
-        Using this equation:
-            offer(t) = p0 + (rv-px)(t/tix)^b
-            which is:
-                p0 - The first offer in the historical offers.
-                pix - The current price of the random offer chosen.
-                t - The time of the random offer chosen.
-                Ti - The deadline negotiation time.
-                b - The concession parameter (will be found using another helper function).
-        Args:
-            offer (tuple): The offer in which the regression line is calculated.
+        The regression analysis process:
+            At each random point that chosen in the __call__() method, the agent have to calculate
+            the regression curve li based on the opponent's historical offers.
+            Using this equation:
+                offer(t) = p0 + (rv-px)(t/tix)^b
+                which is:
+                    p0 - The first offer in the historical offers.
+                    pix - The current price of the random offer chosen.
+                    t - The time of the random offer chosen.
+                    Ti - The deadline negotiation time.
+                    b - The concession parameter (will be found using another helper function).
+            Args:
+                rand_offer(tuple): The offer in which the regression line is calculated.
+                current_offer(tuple): The current offer from the opponent.
+            ***
+            Note:
+                We adopt Dynamic Programming in this case to save time,
+                computational efficiency and performance.
+            ***
         """
-        p0 = self.previous_offers[0]
-        tix = rand_offer[1]  # The offer's time in the second place in the tuple.
-        pix = rand_offer[0]  # The offer itself is in the first place in the tuple.
-        rv = rand_offer[2]  # The offer's reservation value.
+        rand_offer_key = self.generate_key_for_dp(offer=rand_offer, parent_offer=current_offer)
+        if not rand_offer_key in self.regression_calculations_dp.keys():
+            p0 = self.previous_offers[-1][1]
+            tix = rand_offer[1]  # The offer's time in the second place in the tuple.
+            pix = rand_offer[0]  # The offer itself is in the first place in the tuple.
+            rv = rand_offer[2]  # The offer's reservation value.
 
-        t = current_offer[0]  # The current offer's relative time
-        pi = current_offer[1]  # The current offer's itself
-        b = self.get_beta(p0=p0, tix=tix, t=t,
-                          pi=pi, pix=pix)  # The concession parameter
-        return p0 + (rv - p0) * pow((t / tix), b)
+            t = current_offer[0]  # The current offer's relative time
+            pi = current_offer[1]  # The current offer's itself
+            b = self.get_beta(p0=p0, tix=tix, t=t,
+                              pi=pi, pix=pix)  # The concession parameter
+            # The regression curve represents as tuple (time,bound (The curve itself))
+            self.regression_calculations_dp[rand_offer_key] = (rand_offer[0], p0 + (rv - p0) * pow((t / tix), b))
+        return self.regression_calculations_dp[rand_offer_key]
 
     def get_beta(self, p0, tix, t, pix, pi) -> float:
         """
@@ -317,14 +326,9 @@ class GeneralNegotiationModel(SAONegotiator):
         for previous_original_offer in self.previous_offers:
             for offer in random_offers:
                 # We want to calculate the regression curve foreach offer
-                offer_key = self.generate_key_for_dp(offer, parent_offer=previous_original_offer)
-                if offer_key not in self.regression_calculations_dp.keys():
-                    li = self.calc_regression_curve(rand_offer=offer, current_offer=previous_original_offer)
-                    self.regression_calculations_dp[offer_key] = li
-                else:
-                    li = self.regression_calculations_dp[offer_key]
+                li = self.calc_regression_curve(rand_offer=offer, current_offer=previous_original_offer)
                 # If the regression line in fitted to the one in the params, it labels as fitted.
-                if li >= regression_line:
+                if li[0] >= regression_line[0] and li[1] >= regression_line[1]:
                     fitted_offers.append(offer)
         return fitted_offers
 
@@ -399,6 +403,78 @@ class GeneralNegotiationModel(SAONegotiator):
 
         return numerator / denominator  # The correlation value at the end.
 
-    @staticmethod
-    def transform_probability_key(k):
-        return int(k.split('H')[-1])
+    def is_acceptable(self, current_offer, reserved_offer, rand_offer):
+        """
+            The concession strategy, we consider three different scenarios,
+            and in each scenario,
+            the buyer needs to adopt different concession strategies to maximize its expected utility.
+            Args:
+                current_offer (tuple): The agent's current offer.
+                reserved_offer (tuple): The agent's reservation offer at the deadline.
+                rand_offer (tuple): The random reservation offer of opponent.
+        """
+        p0 = self.previous_offers[-1][1]
+        tix = rand_offer[0]
+        Tb = reserved_offer[0]
+        pix = rand_offer[1]
+        t = current_offer[0]
+        pi = current_offer[1]
+
+        # First scenario - the agent's random reservation point is in the negotiation region
+        if tix < Tb and pix > p0:
+            return rand_offer
+        # Second scenario - the random reservation point is out of the agent’s negotiation region
+        elif tix >= Tb and pix >= p0:
+            reg_line = self.calc_regression_curve(rand_offer=rand_offer, current_offer=current_offer)
+            # We need to check if the regression curve pass through the negotiation region in any case
+            if self.is_crosses_region(regression_curve=reg_line):
+                # If the regression curve is in the negotiation region,
+                # we need to check if the random offer is on the right side of the regression curve
+                if tix >= reg_line[0] and pix >= reg_line[1]:
+                    p1_concession_point = (
+                        reserved_offer[0] - 1, reserved_offer[1])  # (T(b-1),rv) as the concession point
+                    return p1_concession_point
+                b0 = self.get_beta(p0=p0, tix=tix, t=t, pi=pi, pix=pix)
+                phi = np.random.uniform(0.99, 1.0)  # φ(max) has to be quite close to 1.
+                p2_concession_point = (b0 + 1, phi * self.DetReg_tuple[3])  # (b0 + 1,φ(max) · RPb)
+                return p2_concession_point
+        # Third scenario
+        elif rand_offer[0] < reserved_offer[0] and rand_offer[1] < current_offer[1]:
+            reg_line = self.calc_regression_curve(rand_offer=rand_offer, current_offer=current_offer)
+            if self.is_crosses_bottom_line_region(regression_curve=reg_line):
+                # set the concession point P1 be the point one step earlier than the
+                # intersection point on the regression line.
+                p1_concession_point = self.previous_offers[-1]
+                return p1_concession_point
+            # price will keep almost the same as the current price p0
+            phi = random.random() * 0.001  # φ(min) need to be quite close to 0
+            p2_concession_point = (rand_offer[0], (1 + phi) * p0)  # (tix,(1 + φ(min)· p0)
+            return p2_concession_point
+
+        elif tix >= Tb and pix <= p0:
+            reg_line = self.calc_regression_curve(rand_offer=rand_offer, current_offer=current_offer)
+            if self.is_crosses_region(regression_curve=reg_line):
+                if tix >= reg_line[0] and pix >= reg_line[1]:
+                    p1_concession_point = (
+                        reserved_offer[0] - 1, reserved_offer[1])  # (T(b-1),rv) as the concession point
+                    return p1_concession_point
+            elif self.is_crosses_bottom_line_region(regression_curve=reg_line):
+                p1_concession_point = self.previous_offers[-1]
+                return p1_concession_point
+            elif rand_offer[0] < reserved_offer[0] and rand_offer[1] < current_offer[1]:
+                phi = random.random() * 0.001  # φ(min) need to be quite close to 0
+                p2_concession_point = (rand_offer[0], (1 + phi) * p0)  # (tix,(1 + φ(min)· p0)
+                return p2_concession_point
+            else:
+                b0 = self.get_beta(p0=p0, tix=tix, t=t, pi=pi, pix=pix)
+                phi = np.random.uniform(0.99, 1.0)  # φ(max) has to be quite close to 1.
+                p2_concession_point = (b0 + 1, phi * self.DetReg_tuple[3])  # (b0 + 1,φ(max) · RPb)
+                return p2_concession_point
+
+    def is_crosses_region(self, regression_curve) -> bool:
+        # TODO: CHECK IF THE CONDITIONS ARE CORRECT.
+        return self.DetReg_tuple[0] <= regression_curve[0] <= self.DetReg_tuple[1] \
+            and self.DetReg_tuple[2] <= regression_curve[1] <= self.DetReg_tuple[3]
+
+    def is_crosses_bottom_line_region(self, regression_curve):
+        return self.DetReg_tuple[0] <= regression_curve[0]
